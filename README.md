@@ -1,134 +1,72 @@
-# SearchHelper
+# SearchHelper 3.1.2
 
-**SearchHelper** — настольное приложение на C++ для локального поиска по CSV-файлам. Программа просматривает CSV-файлы в папке `data` рядом с исполняемым файлом и показывает найденные строки в таблице или в виде графа связей.
+**SearchHelper** is a Windows desktop application for searching through local CSV databases and exploring relationships between matching data.
 
-> Используйте программу только с данными, которые вы имеете право обрабатывать. Не загружайте и не распространяйте персональные данные без законного основания и разрешения.
+It provides a dark user interface with table and graph views, making it easier to inspect search results and discover connections.
 
-## Возможности
+## Features
 
-- Поиск текста без учёта регистра по полям CSV.
-- Автоматическое обнаружение CSV-файлов в папке `data`.
-- Поддержка разделителей: запятая (`,`), точка с запятой (`;`) и табуляция.
-- Табличное представление результатов.
-- Граф связей: найденные записи и значения их полей отображаются в виде узлов.
-- Одинаковые значения одного и того же поля могут объединяться в общий узел графа.
-- Узлы графа можно перемещать мышью.
-- Изменяемый размер окна.
-- Нативный интерфейс Windows на Win32 API — Qt не требуется.
+- **Local CSV Search** — search through CSV files stored on your computer.
+- **Table View** — view matching records in a structured table.
+- **Relationship Graph** — explore connections between matching data.
+- **Graph Screenshot** — capture the relationship graph and copy the image directly to the Windows clipboard.
+- **Automatic Data Folder** — the application automatically creates a `data` folder on first launch if it does not exist.
+- **Record Details** — select a result to inspect its matching fields.
 
-## Скриншоты
+## Screenshots
 
-Добавьте сюда скриншоты приложения, например:
+_Add application screenshots here._
 
-```text
-docs/
-  screenshots/
-    main-window.png
-    graph-view.png
-```
+## Requirements
 
-После добавления файлов раскомментируйте и обновите ссылки:
-
-<!--
-![Окно SearchHelper](docs/screenshots/main-window.png)
-![Граф связей](docs/screenshots/graph-view.png)
--->
-
-## Требования
-
-- Windows 10 или Windows 11.
-- Visual Studio с компонентом **Desktop development with C++**.
-- MSVC x64.
-- CMake 3.21 или новее.
-- NMake (устанавливается вместе с инструментами MSVC).
-
-Qt и другие сторонние GUI-фреймворки не нужны.
-
-## Сборка
-
-Откройте **x64 Native Tools Command Prompt for VS** и перейдите в корневую папку проекта, где находится `CMakeLists.txt`.
-
-```bat
-cmake -S . -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
-
-Исполняемый файл будет создан здесь:
-
-```text
-build\SearchHelper.exe
-```
-
-Запуск:
-
-```bat
-build\SearchHelper.exe
-```
-
-Если команда `cmake` не распознаётся, установите CMake через Visual Studio Installer (компонент **C++ CMake tools for Windows**) или установите CMake отдельно и добавьте его в `PATH`.
-
-## Подготовка CSV-файлов
-
-Рядом с `SearchHelper.exe` создайте папку `data` и поместите в неё CSV-файлы:
-
-```text
-SearchHelper/
-├── build/
-│   └── SearchHelper.exe
-└── data/
-    ├── people.csv
-    └── contacts.csv
-```
-
-Если папки `data` нет, приложение создаст её автоматически рядом с `SearchHelper.exe`.
-
-Пример CSV:
-
-```csv
-id,username,name,email,number
-1,ivan,Иван Иванов,ivan@example.com,79990000000
-2,anna,Анна Петрова,anna@example.com,79991111111
-```
-
-Рекомендуется сохранять CSV в UTF-8. Первая строка файла используется как заголовок колонок. Поиск выполняется по всем значениям последующих строк.
-
-## Как работает граф
-
-Граф строится на основе найденных строк CSV:
-
-- запись отображается отдельным узлом;
-- значения полей отображаются узлами атрибутов;
-- совпадающие значения одного и того же поля могут быть представлены общим узлом;
-- связи показывают, какие записи имеют общие значения.
-
-В текущей реализации для графического представления ограничено количество отображаемых найденных записей (до 180), чтобы не перегружать интерфейс.
-
-## Ограничения текущей версии
-
-- CSV читается построчно; многострочные значения внутри кавычек не поддерживаются.
-- Для корректного отображения кириллицы используйте UTF-8.
-- Автоматическое определение разделителя ориентируется на первую строку файла.
-- Граф является базовым представлением связей по общим значениям, а не полной заменой Maltego.
-- Приложение выполняет локальный поиск по файлам в `data`; оно не подключается к внешним базам данных.
-
-## Структура проекта
-
-```text
-SearchHelper/
-├── CMakeLists.txt
-├── README.md
-└── src/
-    └── main.cpp
-```
-
-## Технологии
-
-- C++17
-- Win32 API
-- Windows Common Controls
+- Windows 10 or Windows 11
+- Microsoft Visual C++ (MSVC)
 - CMake
-- MSVC x64
+- Visual Studio C++ build tools
 
-## Лицензия
+## Build from Source
 
-Лицензия проекта пока не указана. Перед публикацией репозитория выберите подходящую лицензию и добавьте файл `LICENSE`.
+Open **x64 Native Tools Command Prompt for Visual Studio** and run:
+
+```bat
+cmake -S . -B build -A x64
+cmake --build build --config Release
+```
+
+The compiled application will be placed in the build output directory.
+
+## Usage
+
+1. Launch SearchHelper.
+2. Place your CSV database files inside the `data` folder next to the application executable.
+3. Enter your search query.
+4. Click **Find**.
+5. Switch between Table View and Relationship Graph to explore the results.
+6. Use the camera button to copy a screenshot of the graph to the clipboard.
+
+## Project Structure
+
+```text
+SearchHelper/
+├── data/
+├── src/
+│   └── main.cpp
+├── CMakeLists.txt
+└── README.md
+```
+
+The `data` folder is created automatically if it is missing.
+
+## Version
+
+**Current version:** 3.1.2
+
+### What's New in 3.1.2
+
+- Added automatic creation of the `data` directory.
+- Added graph screenshot capture.
+- Added copying graph screenshots directly to the Windows clipboard.
+
+## License
+
+No license has been specified yet.

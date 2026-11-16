@@ -23,6 +23,7 @@ constexpr int ID_LIST = 105;
 constexpr int ID_CANVAS = 106;
 constexpr int ID_STATUS = 107;
 constexpr int ID_DETAILS = 108;
+constexpr int ID_CAMERA = 109;
 HBRUSH g_bgBrush=nullptr, g_panelBrush=nullptr, g_editBrush=nullptr;
 
 struct Record {
@@ -42,7 +43,7 @@ struct GraphEdge { int from=0, to=0; };
 struct DatabaseCount { std::wstring name; int count=0; };
 
 HWND g_main=nullptr, g_query=nullptr, g_go=nullptr, g_table=nullptr, g_graph=nullptr;
-HWND g_list=nullptr, g_canvas=nullptr, g_status=nullptr, g_hint=nullptr, g_details=nullptr;
+HWND g_list=nullptr, g_canvas=nullptr, g_status=nullptr, g_hint=nullptr, g_details=nullptr, g_camera=nullptr;
 HFONT g_font=nullptr, g_fontBold=nullptr, g_fontSmall=nullptr;
 bool g_graphMode=false;
 std::vector<Record> g_records;
@@ -108,6 +109,46 @@ fs::path appFolder() {
     return fs::path(p).parent_path();
 }
 void setStatus(const std::wstring& s) { SetWindowTextW(g_status,s.c_str()); }
+
+bool ensureDataFolder() {
+    std::error_code ec;
+    fs::create_directories(appFolder()/L"data", ec);
+    return !ec && fs::exists(appFolder()/L"data", ec) && !ec;
+}
+
+bool copyGraphToClipboard(HWND owner) {
+    if (!g_canvas || !IsWindow(g_canvas)) return false;
+    RECT rc{};
+    if (!GetClientRect(g_canvas, &rc)) return false;
+    const int width = rc.right - rc.left;
+    const int height = rc.bottom - rc.top;
+    if (width <= 0 || height <= 0) return false;
+
+    UpdateWindow(g_canvas);
+    HDC source = GetDC(g_canvas);
+    if (!source) return false;
+    HDC memory = CreateCompatibleDC(source);
+    HBITMAP bitmap = memory ? CreateCompatibleBitmap(source, width, height) : nullptr;
+    if (!memory || !bitmap) {
+        if (bitmap) DeleteObject(bitmap);
+        if (memory) DeleteDC(memory);
+        ReleaseDC(g_canvas, source);
+        return false;
+    }
+    HGDIOBJ oldBitmap = SelectObject(memory, bitmap);
+    const BOOL copied = BitBlt(memory, 0, 0, width, height, source, 0, 0, SRCCOPY);
+    SelectObject(memory, oldBitmap);
+    DeleteDC(memory);
+    ReleaseDC(g_canvas, source);
+    if (!copied) { DeleteObject(bitmap); return false; }
+
+    if (!OpenClipboard(owner)) { DeleteObject(bitmap); return false; }
+    EmptyClipboard();
+    HANDLE result = SetClipboardData(CF_BITMAP, bitmap);
+    CloseClipboard();
+    if (!result) { DeleteObject(bitmap); return false; }
+    return true; // The clipboard owns the bitmap after SetClipboardData succeeds.
+}
 
 void setFont(HWND h, HFONT f=g_font) { SendMessageW(h,WM_SETFONT,(WPARAM)f,TRUE); }
 HWND makeLabel(HWND parent,int id,const wchar_t* text,int x,int y,int w,int h,HFONT f=nullptr) {
@@ -334,7 +375,8 @@ void layout(HWND w) {
     MoveWindow(g_go,W-M-128,105,128,42,TRUE);
     MoveWindow(g_table,M,164,124,36,TRUE);
     MoveWindow(g_graph,M+134,164,136,36,TRUE);
-    MoveWindow(g_hint,M+290,170,W-M-310,24,TRUE);
+    MoveWindow(g_camera,M+280,164,112,36,TRUE);
+    MoveWindow(g_hint,M+410,170,W-M-430,24,TRUE);
     int contentTop=210, statusH=30, detailsH=(std::max)(130,H/5);
     int listH=(std::max)(170,H-contentTop-statusH-detailsH-18);
     MoveWindow(g_list,M,contentTop,W-2*M,listH,TRUE);
@@ -372,7 +414,8 @@ LRESULT CALLBACK mainProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         g_go=CreateWindowW(L"BUTTON",L"Найти",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW|WS_TABSTOP,0,0,100,40,w,(HMENU)(INT_PTR)ID_GO,nullptr,nullptr);
         g_table=CreateWindowW(L"BUTTON",L"Таблица",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW|WS_TABSTOP,0,0,100,36,w,(HMENU)(INT_PTR)ID_TABLE,nullptr,nullptr);
         g_graph=CreateWindowW(L"BUTTON",L"Граф связей",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW|WS_TABSTOP,0,0,100,36,w,(HMENU)(INT_PTR)ID_GRAPH,nullptr,nullptr);
-        setFont(g_go);setFont(g_table);setFont(g_graph);
+        g_camera=CreateWindowW(L"BUTTON",L"\U0001F4F7",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW|WS_TABSTOP,0,0,100,36,w,(HMENU)(INT_PTR)ID_CAMERA,nullptr,nullptr);
+        setFont(g_go);setFont(g_table);setFont(g_graph);setFont(g_camera);
         g_hint=makeLabel(w,203,L"Перетащите узлы мышью. Общие значения объединяются в один узел.",0,0,0,0,g_fontSmall);
         g_list=CreateWindowExW(WS_EX_CLIENTEDGE,WC_LISTVIEWW,L"",WS_CHILD|WS_VISIBLE|LVS_REPORT|LVS_SHOWSELALWAYS|LVS_SINGLESEL,0,0,100,100,w,(HMENU)(INT_PTR)ID_LIST,nullptr,nullptr);
         ListView_SetExtendedListViewStyle(g_list,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER|LVS_EX_HEADERDRAGDROP);setFont(g_list);
@@ -386,8 +429,9 @@ LRESULT CALLBACK mainProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         setFont(g_status);
         g_bgBrush=CreateSolidBrush(C_BG);g_panelBrush=CreateSolidBrush(C_PANEL);g_editBrush=CreateSolidBrush(RGB(25,35,52));
         SetWindowTheme(g_status,L"DarkMode_Explorer",nullptr);
-        fs::create_directories(appFolder()/L"data");
+        const bool dataReady = ensureDataFolder();
         layout(w); fillTable(); switchView(false);
+        if (!dataReady) setStatus(L"Не удалось создать папку data рядом с программой. Проверьте права доступа.");
         return 0;
     }
     case WM_SIZE: layout(w); return 0;
@@ -395,6 +439,12 @@ LRESULT CALLBACK mainProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         if(LOWORD(wp)==ID_GO){doSearch();return 0;}
         if(LOWORD(wp)==ID_TABLE){switchView(false);return 0;}
         if(LOWORD(wp)==ID_GRAPH){switchView(true);return 0;}
+        if(LOWORD(wp)==ID_CAMERA){
+            if(!g_graphMode) switchView(true);
+            if(copyGraphToClipboard(w)) setStatus(L"Снимок графа скопирован в буфер обмена. Вставьте его через Ctrl+V.");
+            else setStatus(L"Не удалось скопировать граф. Попробуйте ещё раз.");
+            return 0;
+        }
         break;
     case WM_GETMINMAXINFO:{auto*m=(MINMAXINFO*)lp;m->ptMinTrackSize.x=820;m->ptMinTrackSize.y=560;return 0;}
     case WM_DESTROY:

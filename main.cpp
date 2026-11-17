@@ -1,467 +1,842 @@
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
+#include "imnodes.h"
+#include <GLFW/glfw3.h>
 #include <windows.h>
-#include <windowsx.h>
-#include <windowsx.h>
-#include <commctrl.h>
-#include <uxtheme.h>
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
-#include <string>
-#include <vector>
-#include <unordered_map>
-#include <algorithm>
-#include <cwctype>
-#include <memory>
+#include <iostream>
 #include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
 namespace fs = std::filesystem;
-
-constexpr int ID_QUERY = 101;
-constexpr int ID_GO = 102;
-constexpr int ID_TABLE = 103;
-constexpr int ID_GRAPH = 104;
-constexpr int ID_LIST = 105;
-constexpr int ID_CANVAS = 106;
-constexpr int ID_STATUS = 107;
-constexpr int ID_DETAILS = 108;
-constexpr int ID_CAMERA = 109;
-HBRUSH g_bgBrush=nullptr, g_panelBrush=nullptr, g_editBrush=nullptr;
+using json = nlohmann::json;
 
 struct Record {
-    std::wstring database;
-    int csvLine = 0;
-    std::vector<std::pair<std::wstring,std::wstring>> fields;
-    std::wstring summary;
+    std::vector<std::string> fields;
+    std::string              source;
 };
-struct GraphNode {
-    enum Kind { RecordNode, ValueNode } kind = RecordNode;
-    std::wstring title, subtitle, key;
-    int x=0, y=0, w=210, h=64;
-    int recordIndex=-1;
-    int connections=0;
+
+struct Database {
+    std::vector<std::string> columns;
+    std::vector<Record>      rows;
 };
-struct GraphEdge { int from=0, to=0; };
-struct DatabaseCount { std::wstring name; int count=0; };
 
-HWND g_main=nullptr, g_query=nullptr, g_go=nullptr, g_table=nullptr, g_graph=nullptr;
-HWND g_list=nullptr, g_canvas=nullptr, g_status=nullptr, g_hint=nullptr, g_details=nullptr, g_camera=nullptr;
-HFONT g_font=nullptr, g_fontBold=nullptr, g_fontSmall=nullptr;
-bool g_graphMode=false;
-std::vector<Record> g_records;
-std::vector<DatabaseCount> g_counts;
-std::vector<GraphNode> g_nodes;
-std::vector<GraphEdge> g_edges;
-int g_dragNode=-1, g_dragDx=0, g_dragDy=0;
-int g_totalFiles=0;
+struct Edge { int a = 0; int b = 0; };
 
-COLORREF C_BG=RGB(14,19,30), C_PANEL=RGB(23,31,47), C_PANEL2=RGB(30,41,60);
-COLORREF C_TEXT=RGB(231,238,248), C_MUTED=RGB(150,165,186), C_ACCENT=RGB(75,145,255);
-COLORREF C_LINE=RGB(72,94,126), C_RECORD=RGB(37,87,151), C_VALUE=RGB(35,104,91);
+struct GraphState {
+    std::unordered_map<int, ImVec2> positions;
+    std::vector<Edge>               edges;
+};
 
-std::wstring lower(std::wstring s) {
-    std::transform(s.begin(),s.end(),s.begin(),[](wchar_t c){return (wchar_t)towlower(c);});
-    return s;
-}
-std::wstring trim(std::wstring s) {
-    size_t a=s.find_first_not_of(L" \t\r\n");
-    if(a==s.npos) return {};
-    return s.substr(a,s.find_last_not_of(L" \t\r\n")-a+1);
-}
-std::wstring decodeUtf8(const std::string& s) {
-    if(s.empty()) return {};
-    int n=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,s.data(),(int)s.size(),nullptr,0);
-    UINT cp=CP_UTF8;
-    if(n<=0) { cp=CP_ACP; n=MultiByteToWideChar(cp,0,s.data(),(int)s.size(),nullptr,0); }
-    if(n<=0) return {};
-    std::wstring out(n,L'\0');
-    MultiByteToWideChar(cp,0,s.data(),(int)s.size(),out.data(),n);
-    if(!out.empty() && out.front()==0xFEFF) out.erase(out.begin());
+static std::vector<std::string> ParseCsvLine(const std::string& line) {
+    std::vector<std::string> out;
+    std::string cur;
+    bool inQuotes = false;
+    for (size_t i = 0; i < line.size(); ++i) {
+        char c = line[i];
+        if (inQuotes) {
+            if (c == '"') {
+                if (i + 1 < line.size() && line[i + 1] == '"') { cur += '"'; ++i; }
+                else inQuotes = false;
+            } else cur += c;
+        } else {
+            if (c == '"') inQuotes = true;
+            else if (c == ',') { out.push_back(cur); cur.clear(); }
+            else cur += c;
+        }
+    }
+    out.push_back(cur);
     return out;
 }
-wchar_t detectDelimiter(const std::wstring& s) {
-    wchar_t choices[]={L',',L';',L'\t'}, best=L','; int maxCount=-1;
-    for(wchar_t d:choices) {
-        int n=0; bool quoted=false;
-        for(size_t i=0;i<s.size();++i) {
-            if(s[i]==L'"') {
-                if(quoted && i+1<s.size() && s[i+1]==L'"') { ++i; continue; }
-                quoted=!quoted;
-            } else if(s[i]==d && !quoted) ++n;
-        }
-        if(n>maxCount) { maxCount=n; best=d; }
-    }
-    return best;
-}
-std::vector<std::wstring> parseCsv(const std::wstring& s,wchar_t d) {
-    std::vector<std::wstring> out; std::wstring field; bool quoted=false;
-    for(size_t i=0;i<s.size();++i) {
-        wchar_t c=s[i];
-        if(c==L'"') {
-            if(quoted && i+1<s.size() && s[i+1]==L'"') { field+=L'"'; ++i; }
-            else quoted=!quoted;
-        } else if(c==d && !quoted) { out.push_back(field); field.clear(); }
-        else field+=c;
-    }
-    out.push_back(field); return out;
-}
-fs::path appFolder() {
-    wchar_t p[MAX_PATH]{};
-    GetModuleFileNameW(nullptr,p,MAX_PATH);
-    return fs::path(p).parent_path();
-}
-void setStatus(const std::wstring& s) { SetWindowTextW(g_status,s.c_str()); }
 
-bool ensureDataFolder() {
+static std::string ToLower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    return s;
+}
+
+static bool EnsureDataFolder(const fs::path& dir, std::string& err) {
     std::error_code ec;
-    fs::create_directories(appFolder()/L"data", ec);
-    return !ec && fs::exists(appFolder()/L"data", ec) && !ec;
-}
-
-bool copyGraphToClipboard(HWND owner) {
-    if (!g_canvas || !IsWindow(g_canvas)) return false;
-    RECT rc{};
-    if (!GetClientRect(g_canvas, &rc)) return false;
-    const int width = rc.right - rc.left;
-    const int height = rc.bottom - rc.top;
-    if (width <= 0 || height <= 0) return false;
-
-    UpdateWindow(g_canvas);
-    HDC source = GetDC(g_canvas);
-    if (!source) return false;
-    HDC memory = CreateCompatibleDC(source);
-    HBITMAP bitmap = memory ? CreateCompatibleBitmap(source, width, height) : nullptr;
-    if (!memory || !bitmap) {
-        if (bitmap) DeleteObject(bitmap);
-        if (memory) DeleteDC(memory);
-        ReleaseDC(g_canvas, source);
+    if (fs::exists(dir)) return true;
+    if (!fs::create_directories(dir, ec) || ec) {
+        err = "Не удалось создать папку data: " + ec.message();
         return false;
     }
-    HGDIOBJ oldBitmap = SelectObject(memory, bitmap);
-    const BOOL copied = BitBlt(memory, 0, 0, width, height, source, 0, 0, SRCCOPY);
-    SelectObject(memory, oldBitmap);
-    DeleteDC(memory);
-    ReleaseDC(g_canvas, source);
-    if (!copied) { DeleteObject(bitmap); return false; }
-
-    if (!OpenClipboard(owner)) { DeleteObject(bitmap); return false; }
-    EmptyClipboard();
-    HANDLE result = SetClipboardData(CF_BITMAP, bitmap);
-    CloseClipboard();
-    if (!result) { DeleteObject(bitmap); return false; }
-    return true; // The clipboard owns the bitmap after SetClipboardData succeeds.
+    return true;
 }
 
-void setFont(HWND h, HFONT f=g_font) { SendMessageW(h,WM_SETFONT,(WPARAM)f,TRUE); }
-HWND makeLabel(HWND parent,int id,const wchar_t* text,int x,int y,int w,int h,HFONT f=nullptr) {
-    HWND c=CreateWindowW(L"STATIC",text,WS_CHILD|WS_VISIBLE|SS_LEFT, x,y,w,h,parent,(HMENU)(INT_PTR)id,nullptr,nullptr);
-    setFont(c,f?f:g_font); return c;
-}
-HWND makeButton(HWND parent,int id,const wchar_t* text) {
-    HWND c=CreateWindowW(L"BUTTON",text,WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON|WS_TABSTOP,0,0,100,34,parent,(HMENU)(INT_PTR)id,nullptr,nullptr);
-    setFont(c); return c;
-}
-void addListColumn(int i,const wchar_t* name,int width) {
-    LVCOLUMNW c{}; c.mask=LVCF_TEXT|LVCF_WIDTH|LVCF_SUBITEM;
-    c.pszText=(LPWSTR)name; c.cx=width; c.iSubItem=i;
-    ListView_InsertColumn(g_list,i,&c);
-}
-
-void showRecordDetails(int index) {
-    if(!g_details) return;
-    if(index<0 || index>=(int)g_records.size()) { SetWindowTextW(g_details,L"Выберите строку, чтобы увидеть все найденные поля."); return; }
-    const auto& r=g_records[index];
-    std::wstring text=L"БАЗА: "+r.database+L"    |    СТРОКА CSV: "+std::to_wstring(r.csvLine)+L"\r\n\r\n";
-    for(const auto& f:r.fields) { text+=f.first+L": "; text+=f.second.empty()?L"—":f.second; text+=L"\r\n"; }
-    SetWindowTextW(g_details,text.c_str());
-}
-void drawButton(const DRAWITEMSTRUCT* d) {
-    bool hot=(d->itemState&ODS_HOTLIGHT)!=0, down=(d->itemState&ODS_SELECTED)!=0;
-    COLORREF fill=down?RGB(39,91,160):(hot?RGB(48,76,116):RGB(34,48,70));
-    if((int)d->CtlID==ID_GO) fill=down?RGB(35,103,190):(hot?RGB(74,143,240):C_ACCENT);
-    HBRUSH b=CreateSolidBrush(fill); HPEN p=CreatePen(PS_SOLID,1,fill);
-    HGDIOBJ ob=SelectObject(d->hDC,b),op=SelectObject(d->hDC,p);
-    RoundRect(d->hDC,d->rcItem.left,d->rcItem.top,d->rcItem.right,d->rcItem.bottom,9,9);
-    SelectObject(d->hDC,ob);SelectObject(d->hDC,op);DeleteObject(b);DeleteObject(p);
-    SetBkMode(d->hDC,TRANSPARENT);SetTextColor(d->hDC,C_TEXT);
-    wchar_t label[128]{};GetWindowTextW(d->hwndItem,label,128);
-    RECT r=d->rcItem;DrawTextW(d->hDC,label,-1,&r,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-}
-
-void fillTable() {
-    ListView_DeleteAllItems(g_list);
-    while(Header_GetItemCount(ListView_GetHeader(g_list))>0) ListView_DeleteColumn(g_list,0);
-    addListColumn(0,L"База данных",170);
-    addListColumn(1,L"Строка",75);
-    int available=900; RECT rc{}; GetClientRect(g_list,&rc); available=(std::max)(520,static_cast<int>(rc.right)-270);
-    int longest=available; HDC dc=GetDC(g_list); SelectObject(dc,g_font);
-    for(const auto& rec:g_records) { SIZE z{}; GetTextExtentPoint32W(dc,rec.summary.c_str(),(int)rec.summary.size(),&z); longest=(std::max)(longest,(int)z.cx+36); }
-    ReleaseDC(g_list,dc); addListColumn(2,L"Найденные данные",(std::max)(available,longest));
-    for(int i=0;i<(int)g_records.size();++i) {
-        const auto& r=g_records[i];
-        LVITEMW item{}; item.mask=LVIF_TEXT; item.iItem=i; item.pszText=(LPWSTR)r.database.c_str();
-        ListView_InsertItem(g_list,&item);
-        std::wstring ln=std::to_wstring(r.csvLine);
-        ListView_SetItemText(g_list,i,1,(LPWSTR)ln.c_str());
-        ListView_SetItemText(g_list,i,2,(LPWSTR)r.summary.c_str());
-    }
-    if(!g_records.empty()) { ListView_SetItemState(g_list,0,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED); showRecordDetails(0); }
-    else showRecordDetails(-1);
-}
-
-void buildGraph() {
-    g_nodes.clear(); g_edges.clear();
-    std::unordered_map<std::wstring,int> values;
-    for(int ri=0;ri<(int)g_records.size() && ri<180;++ri) {
-        const auto& rec=g_records[ri];
-        GraphNode person; person.kind=GraphNode::RecordNode;
-        person.title=rec.fields.empty()?L"Запись":trim(rec.fields[0].second);
-        if(person.title.empty()) person.title=L"Запись "+std::to_wstring(ri+1);
-        if(person.title.size()>30) person.title=person.title.substr(0,27)+L"...";
-        person.subtitle=rec.database+L" • строка "+std::to_wstring(rec.csvLine);
-        person.recordIndex=ri;
-        int p=(int)g_nodes.size(); g_nodes.push_back(person);
-
-        for(const auto& field:rec.fields) {
-            std::wstring val=trim(field.second), name=trim(field.first);
-            if(val.empty() || val.size()>140) continue;
-            std::wstring key=lower(name)+L"\x1f"+lower(val);
-            int v;
-            auto it=values.find(key);
-            if(it==values.end()) {
-                GraphNode node; node.kind=GraphNode::ValueNode;
-                node.title=val.size()>34?val.substr(0,31)+L"...":val;
-                node.subtitle=name.empty()?L"Поле CSV":name;
-                node.key=key;
-                v=(int)g_nodes.size(); g_nodes.push_back(std::move(node)); values.emplace(key,v);
-            } else v=it->second;
-            if(v!=p) { g_edges.push_back({p,v}); g_nodes[v].connections++; }
+static Database LoadDatabase(const fs::path& dir, std::string& err) {
+    Database db;
+    if (!fs::exists(dir)) { err = "Папка data отсутствует"; return db; }
+    std::vector<fs::path> files;
+    for (auto& e : fs::directory_iterator(dir))
+        if (e.is_regular_file() && e.path().extension() == ".csv")
+            files.push_back(e.path());
+    std::sort(files.begin(), files.end());
+    bool headerDone = false;
+    for (auto& f : files) {
+        std::ifstream in(f);
+        if (!in) { err += "Не открыт: " + f.string() + "\n"; continue; }
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty()) continue;
+            auto cells = ParseCsvLine(line);
+            if (!headerDone) { db.columns = cells; headerDone = true; }
+            else if (cells.size() == db.columns.size()) {
+                Record r;
+                r.fields = std::move(cells);
+                r.source = f.filename().string();
+                db.rows.push_back(std::move(r));
+            }
         }
     }
-    // Lay out two columns; shared values become junctions between records.
-    int records=0, vals=0;
-    for(auto& n:g_nodes) {
-        if(n.kind==GraphNode::RecordNode) ++records; else ++vals;
-    }
-    int ri=0,vi=0;
-    for(auto& n:g_nodes) {
-        if(n.kind==GraphNode::RecordNode) { n.x=34; n.y=30+ri*104; n.w=245; ++ri; }
-        else { n.x=430; n.y=25+vi*82; n.w=285; ++vi; }
-    }
+    return db;
 }
-void drawRoundRect(HDC dc,RECT r,int radius,COLORREF fill,COLORREF border) {
-    HBRUSH b=CreateSolidBrush(fill); HPEN p=CreatePen(PS_SOLID,1,border);
-    HGDIOBJ ob=SelectObject(dc,b), op=SelectObject(dc,p);
-    RoundRect(dc,r.left,r.top,r.right,r.bottom,radius,radius);
-    SelectObject(dc,ob); SelectObject(dc,op); DeleteObject(b); DeleteObject(p);
+
+struct BirthInfo {
+    bool valid = false;
+    int  year = 0, month = 0, day = 0;
+    int  age  = 0;
+};
+
+static BirthInfo ParseBirthDate(const std::string& s,
+                                int currentYear, int currentMonth, int currentDay) {
+    BirthInfo b;
+    if (s.empty()) return b;
+
+    int y = 0, m = 0, d = 0;
+    if (sscanf_s(s.c_str(), "%d-%d-%d", &y, &m, &d) == 3) {}
+    else if (sscanf_s(s.c_str(), "%d.%d.%d", &d, &m, &y) == 3) {}
+    else if (sscanf_s(s.c_str(), "%d/%d/%d", &d, &m, &y) == 3) {}
+    else if (sscanf_s(s.c_str(), "%d-%d-%d", &d, &m, &y) == 3) {}
+    else if (s.size() == 8 && std::all_of(s.begin(), s.end(), ::isdigit)) {
+        y = std::stoi(s.substr(0, 4));
+        m = std::stoi(s.substr(4, 2));
+        d = std::stoi(s.substr(6, 2));
+    } else {
+        return b;
+    }
+
+    if (y < 1900 || y > currentYear) return b;
+    if (m < 1 || m > 12) return b;
+    if (d < 1 || d > 31) return b;
+
+    int age = currentYear - y;
+    if (currentMonth < m || (currentMonth == m && currentDay < d)) --age;
+    if (age < 0) age = 0;
+
+    b.valid = true;
+    b.year = y; b.month = m; b.day = d;
+    b.age  = age;
+    return b;
 }
-void drawGraph(HWND hwnd) {
-    PAINTSTRUCT ps{}; HDC dc=BeginPaint(hwnd,&ps);
-    RECT client{}; GetClientRect(hwnd,&client);
-    HBRUSH bg=CreateSolidBrush(C_BG); FillRect(dc,&client,bg); DeleteObject(bg);
-    SetBkMode(dc,TRANSPARENT);
-    // Subtle grid.
-    HPEN grid=CreatePen(PS_SOLID,1,RGB(27,37,54)); HGDIOBJ old=SelectObject(dc,grid);
-    for(int x=0;x<client.right;x+=32){MoveToEx(dc,x,0,nullptr);LineTo(dc,x,client.bottom);}
-    for(int y=0;y<client.bottom;y+=32){MoveToEx(dc,0,y,nullptr);LineTo(dc,client.right,y);}
-    SelectObject(dc,old); DeleteObject(grid);
-    // Connections first.
-    HPEN edge=CreatePen(PS_SOLID,2,C_LINE); old=SelectObject(dc,edge);
-    for(const auto& e:g_edges) {
-        if(e.from>=(int)g_nodes.size()||e.to>=(int)g_nodes.size()) continue;
-        const auto&a=g_nodes[e.from]; const auto&b=g_nodes[e.to];
-        MoveToEx(dc,a.x+a.w,a.y+a.h/2,nullptr);
-        POINT bez[3]={{a.x+a.w+55,a.y+a.h/2},{b.x-55,b.y+b.h/2},{b.x,b.y+b.h/2}};
-        PolyBezierTo(dc,bez,3);
-    }
-    SelectObject(dc,old); DeleteObject(edge);
-    for(const auto& n:g_nodes) {
-        RECT r{n.x,n.y,n.x+n.w,n.y+n.h};
-        COLORREF fill=n.kind==GraphNode::RecordNode?C_RECORD:C_VALUE;
-        drawRoundRect(dc,r,12,fill,n.kind==GraphNode::RecordNode?RGB(82,153,245):RGB(68,170,145));
-        SetTextColor(dc,C_TEXT);
-        RECT title{r.left+12,r.top+9,r.right-10,r.top+32};
-        DrawTextW(dc,n.title.c_str(),-1,&title,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
-        SetTextColor(dc,RGB(197,211,231));
-        RECT sub{r.left+12,r.top+35,r.right-10,r.bottom-6};
-        std::wstring subtitle=n.subtitle;
-        if(n.kind==GraphNode::ValueNode && n.connections>1)
-            subtitle+=L"  •  связей: "+std::to_wstring(n.connections);
-        DrawTextW(dc,subtitle.c_str(),-1,&sub,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
-    }
-    if(g_nodes.empty()) {
-        SetTextColor(dc,C_MUTED);
-        RECT r{30,30,client.right-30,90};
-        DrawTextW(dc,L"После поиска здесь появится граф найденных записей и общих значений.",-1,&r,DT_LEFT|DT_TOP|DT_WORDBREAK);
-    }
-    EndPaint(hwnd,&ps);
-}
-int hitNode(int x,int y) {
-    for(int i=(int)g_nodes.size()-1;i>=0;--i) {
-        const auto& n=g_nodes[i];
-        if(x>=n.x&&x<=n.x+n.w&&y>=n.y&&y<=n.y+n.h)return i;
+
+static int FindAgeColumn(const Database& db) {
+    static const char* keys[] = {"age", "birth", "birthdate", "dob",
+                                 "др", "дата рождения", "рождения"};
+    for (int c = 0; c < (int)db.columns.size(); ++c) {
+        std::string lc = ToLower(db.columns[c]);
+        for (auto k : keys)
+            if (lc.find(k) != std::string::npos) return c;
     }
     return -1;
 }
-LRESULT CALLBACK canvasProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
-    switch(msg) {
-    case WM_PAINT: drawGraph(hwnd); return 0;
-    case WM_LBUTTONDOWN: {
-        int x=GET_X_LPARAM(lp),y=GET_Y_LPARAM(lp); g_dragNode=hitNode(x,y);
-        if(g_dragNode>=0) { SetCapture(hwnd); g_dragDx=x-g_nodes[g_dragNode].x; g_dragDy=y-g_nodes[g_dragNode].y; }
-        return 0;
+
+struct SearchHit {
+    int              rowIndex = 0;
+    std::vector<int> matchedColumns;
+};
+
+static std::vector<SearchHit> SearchEx(const Database& db, const std::string& query) {
+    std::vector<SearchHit> hits;
+    if (query.empty()) return hits;
+    std::string q = ToLower(query);
+    for (int i = 0; i < (int)db.rows.size(); ++i) {
+        SearchHit h;
+        h.rowIndex = i;
+        for (int c = 0; c < (int)db.rows[i].fields.size(); ++c)
+            if (ToLower(db.rows[i].fields[c]).find(q) != std::string::npos)
+                h.matchedColumns.push_back(c);
+        if (!h.matchedColumns.empty()) hits.push_back(std::move(h));
     }
-    case WM_MOUSEMOVE:
-        if(g_dragNode>=0 && (wp&MK_LBUTTON)) {
-            g_nodes[g_dragNode].x=GET_X_LPARAM(lp)-g_dragDx;
-            g_nodes[g_dragNode].y=GET_Y_LPARAM(lp)-g_dragDy;
-            InvalidateRect(hwnd,nullptr,FALSE);
-        } return 0;
-    case WM_LBUTTONUP:
-        if(g_dragNode>=0) { ReleaseCapture(); g_dragNode=-1; } return 0;
-    case WM_LBUTTONDBLCLK: return 0;
-    }
-    return DefWindowProcW(hwnd,msg,wp,lp);
-}
-void switchView(bool graph) {
-    g_graphMode=graph;
-    ShowWindow(g_list,graph?SW_HIDE:SW_SHOW);
-    ShowWindow(g_canvas,graph?SW_SHOW:SW_HIDE);
-    InvalidateRect(g_canvas,nullptr,TRUE);
-    InvalidateRect(g_main,nullptr,TRUE);
-}
-void doSearch() {
-    wchar_t buf[1024]{}; GetWindowTextW(g_query,buf,1024);
-    std::wstring query=trim(buf);
-    g_records.clear(); g_counts.clear(); g_totalFiles=0;
-    if(query.empty()) { setStatus(L"Введите запрос для поиска."); fillTable(); buildGraph(); InvalidateRect(g_canvas,nullptr,TRUE); return; }
-    fs::path folder=appFolder()/L"data"; std::error_code ec; fs::create_directories(folder,ec);
-    for(const auto& entry:fs::directory_iterator(folder,ec)) {
-        if(ec || !entry.is_regular_file() || lower(entry.path().extension().wstring())!=L".csv") continue;
-        std::ifstream f(entry.path(),std::ios::binary); if(!f) continue;
-        std::string line; std::vector<std::wstring> lines;
-        while(std::getline(f,line)) { if(!line.empty()&&line.back()=='\r')line.pop_back(); lines.push_back(decodeUtf8(line)); }
-        if(lines.size()<2) continue;
-        ++g_totalFiles;
-        auto headers=parseCsv(lines[0],detectDelimiter(lines[0]));
-        wchar_t delim=detectDelimiter(lines[0]);
-        int before=(int)g_records.size();
-        for(size_t li=1;li<lines.size();++li) {
-            auto cells=parseCsv(lines[li],delim);
-            bool match=false;
-            for(const auto& cell:cells) if(lower(cell).find(lower(query))!=std::wstring::npos){match=true;break;}
-            if(!match)continue;
-            Record r; r.database=entry.path().stem().wstring(); r.csvLine=(int)li+1;
-            for(size_t ci=0;ci<cells.size();++ci) {
-                std::wstring h=ci<headers.size()?trim(headers[ci]):L"Колонка "+std::to_wstring(ci+1);
-                r.fields.push_back({h,cells[ci]});
-                if(!trim(cells[ci]).empty()) { if(!r.summary.empty())r.summary+=L"  |  "; r.summary+=h+L": "+trim(cells[ci]); }
-            }
-            if(r.summary.size()>1800)r.summary.resize(1800);
-            g_records.push_back(std::move(r));
-            if(g_records.size()>=180)break;
-        }
-        int added=(int)g_records.size()-before;
-        if(added>0)g_counts.push_back({entry.path().stem().wstring(),added});
-        if(g_records.size()>=180)break;
-    }
-    fillTable(); buildGraph(); InvalidateRect(g_canvas,nullptr,TRUE);
-    if(g_records.empty()) setStatus(L"Совпадений не найдено. Проверено CSV-файлов: "+std::to_wstring(g_totalFiles));
-    else setStatus(L"Найдено записей: "+std::to_wstring(g_records.size())+L"  •  Баз с совпадениями: "+std::to_wstring(g_counts.size())+L"  •  CSV проверено: "+std::to_wstring(g_totalFiles)+(g_records.size()>=180?L"  •  Показаны первые 180":L""));
-}
-void layout(HWND w) {
-    RECT r{}; GetClientRect(w,&r); int W=r.right,H=r.bottom,M=26;
-    MoveWindow(GetDlgItem(w,201),M,18,W-2*M,42,TRUE);
-    MoveWindow(GetDlgItem(w,202),M,61,W-2*M,25,TRUE);
-    MoveWindow(g_query,M,105,W-2*M-142,42,TRUE);
-    MoveWindow(g_go,W-M-128,105,128,42,TRUE);
-    MoveWindow(g_table,M,164,124,36,TRUE);
-    MoveWindow(g_graph,M+134,164,136,36,TRUE);
-    MoveWindow(g_camera,M+280,164,112,36,TRUE);
-    MoveWindow(g_hint,M+410,170,W-M-430,24,TRUE);
-    int contentTop=210, statusH=30, detailsH=(std::max)(130,H/5);
-    int listH=(std::max)(170,H-contentTop-statusH-detailsH-18);
-    MoveWindow(g_list,M,contentTop,W-2*M,listH,TRUE);
-    MoveWindow(g_canvas,M,contentTop,W-2*M,listH,TRUE);
-    MoveWindow(g_details,M,contentTop+listH+10,W-2*M,detailsH,TRUE);
-    MoveWindow(g_status,0,H-statusH,W,statusH,TRUE);
-}
-LRESULT CALLBACK mainProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
-    switch(msg) {
-    case WM_ERASEBKGND: { RECT r{};GetClientRect(w,&r);FillRect((HDC)wp,&r,g_bgBrush?g_bgBrush:(HBRUSH)(COLOR_WINDOW+1));return 1; }
-    case WM_CTLCOLORSTATIC: { HDC dc=(HDC)wp;SetBkMode(dc,TRANSPARENT);SetTextColor(dc,C_TEXT);return (LRESULT)(g_bgBrush?g_bgBrush:GetStockObject(BLACK_BRUSH)); }
-    case WM_CTLCOLOREDIT: { HDC dc=(HDC)wp;SetTextColor(dc,C_TEXT);SetBkColor(dc,RGB(25,35,52));return (LRESULT)(g_editBrush?g_editBrush:GetStockObject(BLACK_BRUSH)); }
-    case WM_DRAWITEM: drawButton((DRAWITEMSTRUCT*)lp);return TRUE;
-    case WM_NOTIFY: {
-        auto* hdr=(NMHDR*)lp;
-        if(hdr->hwndFrom==g_list && hdr->code==LVN_ITEMCHANGED) {
-            auto* n=(NMLISTVIEW*)lp;
-            if((n->uNewState&LVIS_SELECTED) && n->iItem>=0) showRecordDetails(n->iItem);
-        }
-        if(hdr->hwndFrom==g_list && hdr->code==NM_CUSTOMDRAW) {
-            auto* cd=(NMLVCUSTOMDRAW*)lp;
-            if(cd->nmcd.dwDrawStage==CDDS_PREPAINT)return CDRF_NOTIFYITEMDRAW;
-            if(cd->nmcd.dwDrawStage==CDDS_ITEMPREPAINT){cd->clrText=C_TEXT;cd->clrTextBk=(cd->nmcd.dwItemSpec%2)?C_PANEL:C_PANEL2;return CDRF_NOTIFYSUBITEMDRAW;}
-            if(cd->nmcd.dwDrawStage==(CDDS_ITEMPREPAINT|CDDS_SUBITEM)){cd->clrText=C_TEXT;cd->clrTextBk=(cd->nmcd.dwItemSpec%2)?C_PANEL:C_PANEL2;return CDRF_NEWFONT;}
-        }
-        break;
-    }
-    case WM_CREATE: {
-        g_font=CreateFontW(-17,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Segoe UI");
-        g_fontBold=CreateFontW(-30,0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Segoe UI");
-        g_fontSmall=CreateFontW(-14,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Segoe UI");
-        makeLabel(w,201,L"SearchHelper",0,0,0,0,g_fontBold);
-        makeLabel(w,202,L"Локальный поиск по вашим CSV-файлам  ·  таблица и граф связей",0,0,0,0,g_font);
-        g_query=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL|WS_TABSTOP,0,0,100,40,w,(HMENU)(INT_PTR)ID_QUERY,nullptr,nullptr);setFont(g_query);
-        g_go=CreateWindowW(L"BUTTON",L"Найти",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW|WS_TABSTOP,0,0,100,40,w,(HMENU)(INT_PTR)ID_GO,nullptr,nullptr);
-        g_table=CreateWindowW(L"BUTTON",L"Таблица",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW|WS_TABSTOP,0,0,100,36,w,(HMENU)(INT_PTR)ID_TABLE,nullptr,nullptr);
-        g_graph=CreateWindowW(L"BUTTON",L"Граф связей",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW|WS_TABSTOP,0,0,100,36,w,(HMENU)(INT_PTR)ID_GRAPH,nullptr,nullptr);
-        g_camera=CreateWindowW(L"BUTTON",L"\U0001F4F7",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW|WS_TABSTOP,0,0,100,36,w,(HMENU)(INT_PTR)ID_CAMERA,nullptr,nullptr);
-        setFont(g_go);setFont(g_table);setFont(g_graph);setFont(g_camera);
-        g_hint=makeLabel(w,203,L"Перетащите узлы мышью. Общие значения объединяются в один узел.",0,0,0,0,g_fontSmall);
-        g_list=CreateWindowExW(WS_EX_CLIENTEDGE,WC_LISTVIEWW,L"",WS_CHILD|WS_VISIBLE|LVS_REPORT|LVS_SHOWSELALWAYS|LVS_SINGLESEL,0,0,100,100,w,(HMENU)(INT_PTR)ID_LIST,nullptr,nullptr);
-        ListView_SetExtendedListViewStyle(g_list,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER|LVS_EX_HEADERDRAGDROP);setFont(g_list);
-        ListView_SetBkColor(g_list,C_PANEL);ListView_SetTextBkColor(g_list,C_PANEL);ListView_SetTextColor(g_list,C_TEXT);
-        SetWindowTheme(g_list,L"DarkMode_Explorer",nullptr);
-        SetWindowTheme(ListView_GetHeader(g_list),L"DarkMode_Explorer",nullptr);
-        g_details=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"Выберите строку, чтобы увидеть все найденные поля.",WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL,0,0,100,100,w,(HMENU)(INT_PTR)ID_DETAILS,nullptr,nullptr);
-        setFont(g_details);SetWindowTheme(g_details,L"DarkMode_Explorer",nullptr);
-        g_canvas=CreateWindowExW(WS_EX_CLIENTEDGE,L"SearchHelperGraphCanvas",L"",WS_CHILD|WS_CLIPCHILDREN,0,0,100,100,w,(HMENU)(INT_PTR)ID_CANVAS,nullptr,nullptr);
-        g_status=CreateWindowW(L"STATIC",L"  Готово. CSV-файлы поместите в папку data рядом с программой.",WS_CHILD|WS_VISIBLE|SS_LEFT,0,0,100,28,w,(HMENU)(INT_PTR)ID_STATUS,nullptr,nullptr);
-        setFont(g_status);
-        g_bgBrush=CreateSolidBrush(C_BG);g_panelBrush=CreateSolidBrush(C_PANEL);g_editBrush=CreateSolidBrush(RGB(25,35,52));
-        SetWindowTheme(g_status,L"DarkMode_Explorer",nullptr);
-        const bool dataReady = ensureDataFolder();
-        layout(w); fillTable(); switchView(false);
-        if (!dataReady) setStatus(L"Не удалось создать папку data рядом с программой. Проверьте права доступа.");
-        return 0;
-    }
-    case WM_SIZE: layout(w); return 0;
-    case WM_COMMAND:
-        if(LOWORD(wp)==ID_GO){doSearch();return 0;}
-        if(LOWORD(wp)==ID_TABLE){switchView(false);return 0;}
-        if(LOWORD(wp)==ID_GRAPH){switchView(true);return 0;}
-        if(LOWORD(wp)==ID_CAMERA){
-            if(!g_graphMode) switchView(true);
-            if(copyGraphToClipboard(w)) setStatus(L"Снимок графа скопирован в буфер обмена. Вставьте его через Ctrl+V.");
-            else setStatus(L"Не удалось скопировать граф. Попробуйте ещё раз.");
-            return 0;
-        }
-        break;
-    case WM_GETMINMAXINFO:{auto*m=(MINMAXINFO*)lp;m->ptMinTrackSize.x=820;m->ptMinTrackSize.y=560;return 0;}
-    case WM_DESTROY:
-        if(g_font)DeleteObject(g_font);if(g_fontBold)DeleteObject(g_fontBold);if(g_fontSmall)DeleteObject(g_fontSmall);
-        if(g_bgBrush)DeleteObject(g_bgBrush);if(g_panelBrush)DeleteObject(g_panelBrush);if(g_editBrush)DeleteObject(g_editBrush);
-        PostQuitMessage(0);return 0;
-    }
-    return DefWindowProcW(w,msg,wp,lp);
+    return hits;
 }
 
-int WINAPI wWinMain(HINSTANCE inst,HINSTANCE,PWSTR,int show) {
-    INITCOMMONCONTROLSEX cc{sizeof(cc),ICC_LISTVIEW_CLASSES|ICC_BAR_CLASSES};InitCommonControlsEx(&cc);
-    WNDCLASSW canvas{};canvas.lpfnWndProc=canvasProc;canvas.hInstance=inst;canvas.lpszClassName=L"SearchHelperGraphCanvas";canvas.hCursor=LoadCursorW(nullptr,IDC_ARROW);canvas.hbrBackground=(HBRUSH)GetStockObject(BLACK_BRUSH);RegisterClassW(&canvas);
-    WNDCLASSW wc{};wc.lpfnWndProc=mainProc;wc.hInstance=inst;wc.lpszClassName=L"SearchHelperMain";wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);wc.hIcon=LoadIconW(nullptr,IDI_APPLICATION);
-    if(!RegisterClassW(&wc))return 1;
-    HWND w=CreateWindowW(wc.lpszClassName,L"SearchHelper",WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,CW_USEDEFAULT,1180,820,nullptr,nullptr,inst,nullptr);
-    if(!w)return 1;
-    ShowWindow(w,show);UpdateWindow(w);
-    MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}return (int)msg.wParam;
+static void BuildAutoEdges(const Database& db, const std::vector<int>& hits,
+                           GraphState& g, int& outEdges) {
+    static const char* keys[] = {"mail", "phone", "тел", "номер", "nick"};
+    std::vector<int> keyCols;
+    for (int c = 0; c < (int)db.columns.size(); ++c) {
+        std::string lc = ToLower(db.columns[c]);
+        for (auto k : keys)
+            if (lc.find(k) != std::string::npos) { keyCols.push_back(c); break; }
+    }
+    if (keyCols.empty()) { outEdges = 0; return; }
+    std::unordered_map<std::string, std::vector<int>> buckets;
+    for (int hi = 0; hi < (int)hits.size(); ++hi) {
+        auto& r = db.rows[hits[hi]];
+        for (int c : keyCols) {
+            if (r.fields[c].empty()) continue;
+            buckets[ToLower(r.fields[c])].push_back(hi);
+        }
+    }
+    int added = 0;
+    for (auto& [val, lst] : buckets)
+        for (size_t i = 0; i < lst.size(); ++i)
+            for (size_t j = i + 1; j < lst.size(); ++j) {
+                bool exists = false;
+                for (auto& e : g.edges)
+                    if ((e.a == lst[i] && e.b == lst[j]) ||
+                        (e.a == lst[j] && e.b == lst[i])) { exists = true; break; }
+                if (!exists) { g.edges.push_back({lst[i], lst[j]}); ++added; }
+            }
+    outEdges = added;
+}
+
+static void SaveGraph(const fs::path& file, const GraphState& g) {
+    std::ofstream o(file);
+    if (!o) return;
+    for (auto& e : g.edges) o << e.a << ' ' << e.b << '\n';
+}
+
+static void LoadGraph(const fs::path& file, GraphState& g) {
+    std::ifstream in(file);
+    if (!in) return;
+    int a, b;
+    g.edges.clear();
+    while (in >> a >> b) g.edges.push_back({a, b});
+}
+
+static std::string RunCommandAndCapture(const std::string& command) {
+    std::string result;
+    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+    HANDLE hRead, hWrite;
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return "Error: CreatePipe failed";
+
+    STARTUPINFOA si = { sizeof(STARTUPINFOA) };
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = hWrite;
+    si.hStdError  = hWrite;
+    PROCESS_INFORMATION pi = {};
+
+    std::string cmdLine = "cmd.exe /c " + command;
+
+    if (!CreateProcessA(NULL, (LPSTR)cmdLine.c_str(), NULL, NULL, TRUE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(hRead); CloseHandle(hWrite);
+        return "Error: CreateProcess failed";
+    }
+    CloseHandle(hWrite);
+
+    char buffer[4096];
+    DWORD bytesRead;
+    while (ReadFile(hRead, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+        buffer[bytesRead] = '\0';
+        result += buffer;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    CloseHandle(hRead);
+    return result;
+}
+
+struct ModuleInfo {
+    std::string name;
+    std::string pipPackage;
+    std::string exeName;
+    bool        installed = false;
+};
+
+struct ModuleManager {
+    fs::path root;
+    std::vector<ModuleInfo> mods;
+
+    explicit ModuleManager(const fs::path& base) {
+        root = base / "modules";
+        mods = {
+            {"Sherlock", "sherlock-project", "sherlock.exe", false},
+            {"Holehe",   "holehe",           "holehe.exe",   false},
+            {"Maigret",  "maigret",          "maigret.exe",  false},
+        };
+    }
+
+    bool EnsureRoot(std::string& err) {
+        std::error_code ec;
+        if (fs::exists(root)) return true;
+        if (!fs::create_directories(root, ec) || ec) {
+            err = "Не удалось создать modules: " + ec.message();
+            return false;
+        }
+        return true;
+    }
+
+    void RefreshInstalled() {
+        for (auto& m : mods)
+            m.installed = fs::exists(root / "Scripts" / m.exeName);
+    }
+
+    static std::string FindPython() {
+        const char* candidates[] = {"python.exe", "py.exe"};
+        for (auto c : candidates) {
+            std::string test = std::string(c) + " --version >nul 2>&1";
+            if (std::system(test.c_str()) == 0) return c;
+        }
+        return "";
+    }
+
+    std::string BuildInstallCommand(const ModuleInfo& m) const {
+        std::string py = FindPython();
+        if (py.empty()) return "";
+        return py + " -m pip install --target=\"" + root.string() +
+               "\" --upgrade " + m.pipPackage;
+    }
+};
+
+enum class Screen { Loading, Main };
+
+struct AppState {
+    Screen      screen = Screen::Loading;
+    std::string loadLog;
+    float       loadProgress = 0.f;
+
+    Database               db;
+    std::vector<SearchHit> hits;
+    int                    selected  = -1;
+    int                    ageColumn = -1;
+    char                   query[256] = {};
+    std::string            status = "Готово";
+
+    GraphState       graph;
+    bool             graphEditMode = false;
+    int              pendingFirstNode = -1;
+    std::vector<int> nodeIds;
+
+    char           osintTarget[256] = "";
+    std::string    osintStatus      = "Готов";
+    bool           osintRunning     = false;
+    std::string    osintLog;
+    ModuleManager* modules = nullptr;
+};
+
+static void ApplyDarkTheme() {
+    ImGui::StyleColorsDark();
+    auto& s = ImGui::GetStyle();
+    s.WindowRounding    = 6.0f;
+    s.FrameRounding     = 5.0f;
+    s.GrabRounding      = 5.0f;
+    s.ScrollbarRounding = 6.0f;
+    s.WindowPadding     = ImVec2(10, 10);
+    s.FramePadding      = ImVec2(8, 5);
+    s.ItemSpacing       = ImVec2(8, 6);
+}
+
+static void DrawLoadingScreen(AppState& st) {
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->WorkPos);
+    ImGui::SetNextWindowSize(vp->WorkSize);
+    ImGui::Begin("##loading", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
+
+    float w = ImGui::GetContentRegionAvail().x;
+    ImGui::Dummy(ImVec2(0, 120));
+    ImGui::SetCursorPosX(w * 0.5f - 180);
+    ImGui::Text("SearchHelper");
+    ImGui::SetCursorPosX(w * 0.5f - 180);
+    ImGui::TextDisabled("Инициализация...");
+    ImGui::Dummy(ImVec2(0, 20));
+    ImGui::SetCursorPosX(w * 0.5f - 200);
+    ImGui::ProgressBar(st.loadProgress, ImVec2(400, 8), "");
+    ImGui::Dummy(ImVec2(0, 15));
+    ImGui::SetCursorPosX(w * 0.5f - 200);
+    ImGui::BeginChild("log", ImVec2(400, 160), true);
+    ImGui::TextUnformatted(st.loadLog.c_str());
+    ImGui::EndChild();
+    ImGui::End();
+}
+
+static void DrawTopBar(AppState& st) {
+    ImGui::BeginChild("topbar", ImVec2(0, 70), true);
+    ImGui::TextUnformatted("SearchHelper");
+    ImGui::SameLine();
+    ImGui::TextDisabled("| OSINT");
+
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 240);
+    bool enter = ImGui::InputTextWithHint("##q", "Введите запрос и нажмите Найти...",
+                                          st.query, sizeof(st.query),
+                                          ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    if (ImGui::Button("Найти", ImVec2(90, 0)) || enter) {
+        st.hits      = SearchEx(st.db, st.query);
+        st.ageColumn = FindAgeColumn(st.db);
+        st.selected  = st.hits.empty() ? -1 : 0;
+        st.status    = "Найдено: " + std::to_string(st.hits.size());
+
+        st.nodeIds.clear();
+        for (int i = 0; i < (int)st.hits.size(); ++i) {
+            int id = i + 1;
+            st.nodeIds.push_back(id);
+            if (!st.graph.positions.count(id))
+                st.graph.positions[id] = ImVec2(50 + (i % 8) * 180,
+                                                50 + (i / 8) * 110);
+        }
+        std::vector<int> rowIdx;
+        rowIdx.reserve(st.hits.size());
+        for (auto& h : st.hits) rowIdx.push_back(h.rowIndex);
+        int added = 0;
+        BuildAutoEdges(st.db, rowIdx, st.graph, added);
+        if (added) st.status += " (автосвязей: " + std::to_string(added) + ")";
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Перезагрузить", ImVec2(120, 0))) {
+        std::string err;
+        st.db = LoadDatabase("data", err);
+        st.hits.clear(); st.selected = -1;
+        st.graph.edges.clear(); st.graph.positions.clear();
+        st.status = "Загружено записей: " + std::to_string(st.db.rows.size());
+        if (!err.empty()) st.status += " | " + err;
+    }
+    ImGui::EndChild();
+}
+
+static void DrawTable(AppState& st) {
+    ImGui::BeginChild("table", ImVec2(0, 0), true);
+    ImGui::TextDisabled("Результаты (%d)", (int)st.hits.size());
+    ImGui::Separator();
+
+    ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
+                            ImGuiTableFlags_SizingStretchProp;
+
+    time_t t = time(nullptr);
+    tm now{};
+    localtime_s(&now, &t);
+
+    if (ImGui::BeginTable("results", (int)st.db.columns.size(), flags)) {
+        for (auto& c : st.db.columns) ImGui::TableSetupColumn(c.c_str());
+        ImGui::TableHeadersRow();
+        for (int i = 0; i < (int)st.hits.size(); ++i) {
+            auto& h = st.hits[i];
+            auto& r = st.db.rows[h.rowIndex];
+            ImGui::TableNextRow();
+            for (int c = 0; c < (int)r.fields.size(); ++c) {
+                ImGui::TableSetColumnIndex(c);
+
+                std::string display = r.fields[c];
+                if (c == st.ageColumn) {
+                    auto b = ParseBirthDate(r.fields[c], now.tm_year + 1900,
+                                            now.tm_mon + 1, now.tm_mday);
+                    if (b.valid)
+                        display += "  (" + std::to_string(b.age) + " лет)";
+                }
+
+                bool matched = std::find(h.matchedColumns.begin(),
+                                         h.matchedColumns.end(), c)
+                               != h.matchedColumns.end();
+                if (matched)
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                                          ImVec4(1.0f, 0.85f, 0.3f, 1.0f));
+
+                bool sel = (st.selected == i);
+                if (ImGui::Selectable(display.c_str(), sel,
+                                      ImGuiSelectableFlags_SpanAllColumns))
+                    st.selected = i;
+
+                if (matched) ImGui::PopStyleColor();
+            }
+        }
+        ImGui::EndTable();
+    }
+    ImGui::EndChild();
+}
+
+static void DrawDetails(AppState& st) {
+    ImGui::BeginChild("details", ImVec2(0, 0), true);
+    ImGui::TextUnformatted("Детали записи");
+    ImGui::Separator();
+
+    time_t t = time(nullptr);
+    tm now{};
+    localtime_s(&now, &t);
+
+    if (st.selected >= 0 && st.selected < (int)st.hits.size()) {
+        auto& h = st.hits[st.selected];
+        auto& r = st.db.rows[h.rowIndex];
+
+        for (int c = 0; c < (int)st.db.columns.size(); ++c) {
+            ImGui::TextDisabled("%s", st.db.columns[c].c_str());
+            std::string val = r.fields[c];
+            if (c == st.ageColumn) {
+                auto b = ParseBirthDate(r.fields[c], now.tm_year + 1900,
+                                        now.tm_mon + 1, now.tm_mday);
+                if (b.valid)
+                    val += "   →   " + std::to_string(b.age) + " лет";
+            }
+            ImGui::TextWrapped("%s", val.c_str());
+            ImGui::Spacing();
+        }
+
+        ImGui::Separator();
+        if (!h.matchedColumns.empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+                               "Совпадения (%d):",
+                               (int)h.matchedColumns.size());
+            for (int c : h.matchedColumns) {
+                ImGui::Bullet(); ImGui::SameLine();
+                ImGui::Text("%s = %s",
+                            st.db.columns[c].c_str(),
+                            r.fields[c].c_str());
+            }
+            if (h.matchedColumns.size() >= 2)
+                ImGui::TextDisabled("Найдено два и более совпадения в одной записи.");
+            ImGui::Spacing();
+        }
+        ImGui::Separator();
+        ImGui::TextDisabled("Источник: %s", r.source.c_str());
+    } else {
+        ImGui::TextDisabled("Выберите запись в таблице");
+    }
+    ImGui::EndChild();
+}
+
+static void DrawGraph(AppState& st) {
+    ImGui::BeginChild("graph", ImVec2(0, 0), true);
+    if (ImGui::Button(st.graphEditMode ? "Режим добавления: ВКЛ" : "Добавить связь")) {
+        st.graphEditMode = !st.graphEditMode;
+        st.pendingFirstNode = -1;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Сохранить граф")) SaveGraph("data/graph.txt", st.graph);
+    ImGui::SameLine();
+    if (ImGui::Button("Загрузить граф")) LoadGraph("data/graph.txt", st.graph);
+    ImGui::SameLine();
+    if (ImGui::Button("Очистить")) { st.graph.edges.clear(); st.pendingFirstNode = -1; }
+    ImGui::SameLine();
+    ImGui::TextDisabled("ЛКМ — тащить узел, ПКМ по ребру — удалить");
+
+    if (st.graphEditMode) {
+        ImGui::TextColored(ImVec4(1,0.8f,0.3f,1),
+            "Режим добавления: кликните по двум узлам, чтобы соединить их");
+        if (st.pendingFirstNode >= 0)
+            ImGui::TextColored(ImVec4(1,0.8f,0.3f,1),
+                "Первый узел: #%d. Выберите второй.", st.pendingFirstNode);
+    }
+    ImGui::Separator();
+
+    ImNodes::BeginNodeEditor();
+    for (int i = 0; i < (int)st.nodeIds.size(); ++i) {
+        int id = st.nodeIds[i];
+        auto& r = st.db.rows[st.hits[i].rowIndex];
+        ImNodes::BeginNode(id);
+        ImNodes::BeginNodeTitleBar();
+        ImGui::TextUnformatted(st.db.columns.empty() ? "record"
+                                                     : r.fields[0].c_str());
+        ImNodes::EndNodeTitleBar();
+        for (int c = 1; c < (int)st.db.columns.size(); ++c) {
+            ImGui::TextDisabled("%s", st.db.columns[c].c_str());
+            ImGui::TextWrapped("%s", r.fields[c].c_str());
+        }
+        ImNodes::EndNode();
+    }
+
+    int edgeToDelete = -1;
+    for (int ei = 0; ei < (int)st.graph.edges.size(); ++ei) {
+        auto& e = st.graph.edges[ei];
+        ImNodes::Link(ei + 1000, e.a, e.b);
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            ImVec2 pa = st.graph.positions[e.a];
+            ImVec2 pb = st.graph.positions[e.b];
+            ImVec2 mid = ImVec2((pa.x + pb.x) * 0.5f + 120,
+                                (pa.y + pb.y) * 0.5f + 30);
+            ImVec2 m = ImGui::GetMousePos();
+            float dx = m.x - mid.x, dy = m.y - mid.y;
+            if (dx*dx + dy*dy < 20.f * 20.f) edgeToDelete = ei;
+        }
+    }
+    if (edgeToDelete >= 0) {
+        st.graph.edges.erase(st.graph.edges.begin() + edgeToDelete);
+        st.status = "Связь удалена";
+    }
+    ImNodes::EndNodeEditor();
+
+    if (st.graphEditMode && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        ImVec2 mouse = ImGui::GetMousePos();
+        int clicked = -1;
+        for (int i = 0; i < (int)st.nodeIds.size(); ++i) {
+            int id = st.nodeIds[i];
+            ImVec2 p = ImNodes::GetNodeScreenSpacePos(id);
+            ImVec2 s = ImNodes::GetNodeDimensions(id);
+            if (mouse.x >= p.x && mouse.x <= p.x + s.x &&
+                mouse.y >= p.y && mouse.y <= p.y + s.y) { clicked = id; break; }
+        }
+        if (clicked >= 0) {
+            if (st.pendingFirstNode < 0) st.pendingFirstNode = clicked;
+            else if (st.pendingFirstNode != clicked) {
+                bool exists = false;
+                for (auto& e : st.graph.edges)
+                    if ((e.a == st.pendingFirstNode && e.b == clicked) ||
+                        (e.a == clicked && e.b == st.pendingFirstNode)) { exists = true; break; }
+                if (!exists) {
+                    st.graph.edges.push_back({st.pendingFirstNode, clicked});
+                    st.status = "Связь добавлена";
+                }
+                st.pendingFirstNode = -1;
+            }
+        }
+    }
+    ImGui::EndChild();
+}
+
+static void DrawOsintTab(AppState& st) {
+    ImGui::BeginChild("osint_tab", ImVec2(0, 0), true);
+    ImGui::TextWrapped(
+        "Инструменты ставятся в локальную папку modules\\ рядом с программой. "
+        "Системный Python не затрагивается. Нужен установленный Python 3.9+.");
+    ImGui::Separator();
+
+    ImGui::TextUnformatted("Модули:");
+    if (ImGui::BeginTable("mod_table", 4,
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Инструмент");
+        ImGui::TableSetupColumn("Пакет");
+        ImGui::TableSetupColumn("Статус");
+        ImGui::TableSetupColumn("Действие", ImGuiTableColumnFlags_WidthFixed, 160);
+        ImGui::TableHeadersRow();
+        for (auto& m : st.modules->mods) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(m.name.c_str());
+            ImGui::TableSetColumnIndex(1); ImGui::TextDisabled("%s", m.pipPackage.c_str());
+            ImGui::TableSetColumnIndex(2);
+            if (m.installed) ImGui::TextColored(ImVec4(0.4f,1,0.4f,1), "установлен");
+            else             ImGui::TextColored(ImVec4(1,0.5f,0.4f,1), "нет");
+            ImGui::TableSetColumnIndex(3);
+            ImGui::PushID(m.name.c_str());
+            if (!m.installed) {
+                if (ImGui::Button("Установить", ImVec2(-1, 0)) && !st.osintRunning) {
+                    std::string cmd = st.modules->BuildInstallCommand(m);
+                    if (cmd.empty()) {
+                        st.osintLog += "[ERR] Python не найден в PATH\n";
+                        st.osintStatus = "Python не найден";
+                    } else {
+                        st.osintRunning = true;
+                        st.osintStatus  = "Установка " + m.name + "...";
+                        st.osintLog    += "$ " + cmd + "\n";
+                        std::thread([&st, cmd, name = m.name]() {
+                            std::string out = RunCommandAndCapture(cmd);
+                            st.osintLog += out + "\n";
+                            st.modules->RefreshInstalled();
+                            st.osintStatus  = "Установка " + name + " завершена";
+                            st.osintRunning = false;
+                        }).detach();
+                    }
+                }
+            } else {
+                if (ImGui::Button("Удалить", ImVec2(-1, 0))) {
+                    std::error_code ec;
+                    fs::remove_all(st.modules->root, ec);
+                    std::string e;
+                    st.modules->EnsureRoot(e);
+                    st.modules->RefreshInstalled();
+                }
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (ImGui::Button("Проверить установку")) st.modules->RefreshInstalled();
+    ImGui::Separator();
+
+    ImGui::SetNextItemWidth(300);
+    ImGui::InputTextWithHint("##t", "username или email",
+                             st.osintTarget, sizeof(st.osintTarget));
+    ImGui::SameLine();
+    auto canRun = [&](const ModuleInfo& m) {
+        return m.installed && !st.osintRunning && st.osintTarget[0] != '\0';
+    };
+    for (auto& m : st.modules->mods) {
+        ImGui::PushID(m.name.c_str());
+        if (ImGui::Button(("Запустить " + m.name).c_str()) && canRun(m)) {
+            st.osintRunning = true;
+            st.osintStatus  = "Запуск " + m.name + "...";
+            std::string exe  = (st.modules->root / "Scripts" / m.exeName).string();
+            std::string args = (m.name == "Sherlock") ? " --print-found" : "";
+            std::string full = "\"" + exe + "\" " +
+                               std::string(st.osintTarget) + args;
+            st.osintLog += "$ " + full + "\n";
+            std::thread([&st, full, name = m.name]() {
+                std::string out = RunCommandAndCapture(full);
+                st.osintLog   += out + "\n";
+                st.osintStatus = name + " завершён";
+                st.osintRunning = false;
+            }).detach();
+        }
+        ImGui::SameLine();
+        ImGui::PopID();
+    }
+    ImGui::NewLine();
+    if (st.osintRunning)
+        ImGui::TextColored(ImVec4(1,0.8f,0,1), "Выполняется...");
+    ImGui::Separator();
+    ImGui::Text("Лог:");
+    ImGui::BeginChild("log", ImVec2(0, 0), true);
+    ImGui::TextUnformatted(st.osintLog.c_str());
+    ImGui::EndChild();
+    ImGui::EndChild();
+}
+
+static void DrawMainScreen(AppState& st) {
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->WorkPos);
+    ImGui::SetNextWindowSize(vp->WorkSize);
+    ImGui::Begin("##root", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                 ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+    DrawTopBar(st);
+
+    ImGui::BeginTabBar("tabs");
+    if (ImGui::BeginTabItem("Таблица")) {
+        float availH = ImGui::GetContentRegionAvail().y - 30;
+        ImGui::BeginChild("body", ImVec2(0, availH), false);
+        float tableW = ImGui::GetContentRegionAvail().x - 330;
+        ImGui::BeginChild("left", ImVec2(tableW, 0), false);
+        DrawTable(st);
+        ImGui::EndChild();
+        ImGui::SameLine();
+        ImGui::BeginChild("right", ImVec2(0, 0), false);
+        DrawDetails(st);
+        ImGui::EndChild();
+        ImGui::EndChild();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Граф связей")) {
+        DrawGraph(st);
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("OSINT")) {
+        DrawOsintTab(st);
+        ImGui::EndTabItem();
+    }
+    ImGui::EndTabBar();
+
+    ImGui::Separator();
+    ImGui::TextDisabled("%s", st.status.c_str());
+    ImGui::End();
+}
+
+int main() {
+    if (!glfwInit()) { std::cerr << "glfwInit failed\n"; return 1; }
+
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    GLFWwindow* win = glfwCreateWindow(1280, 760, "SearchHelper", nullptr, nullptr);
+    if (!win) { glfwTerminate(); return 1; }
+    glfwMakeContextCurrent(win);
+    glfwSwapInterval(1);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    ApplyDarkTheme();
+
+    ImGui_ImplGlfw_InitForOpenGL(win, true);
+    ImGui_ImplOpenGL3_Init("#version 330");
+    ImNodes::CreateContext();
+    ImNodes::StyleColorsDark();
+
+    AppState st;
+    ModuleManager mm(".");
+    st.modules = &mm;
+
+    st.loadProgress = 0.0f;
+    st.loadLog = "Запуск...\n";
+
+    int  loadStep = 0;
+    auto startTime = std::chrono::steady_clock::now();
+
+    while (!glfwWindowShouldClose(win)) {
+        glfwPollEvents();
+
+        if (st.screen == Screen::Loading) {
+            auto elapsed = std::chrono::duration<float>(
+                std::chrono::steady_clock::now() - startTime).count();
+            if (elapsed > 0.35f) {
+                if (loadStep == 0) {
+                    std::string err;
+                    if (EnsureDataFolder("data", err))
+                        st.loadLog += "[OK] Папка data готова\n";
+                    else
+                        st.loadLog += "[ERR] " + err + "\n";
+
+                    if (mm.EnsureRoot(err))
+                        st.loadLog += "[OK] Папка modules готова\n";
+                    else
+                        st.loadLog += "[ERR] " + err + "\n";
+
+                    mm.RefreshInstalled();
+                    st.loadProgress = 0.35f;
+                    loadStep = 1;
+                } else if (loadStep == 1) {
+                    std::string err;
+                    st.db = LoadDatabase("data", err);
+                    st.loadLog += "[OK] Загружено записей: " +
+                                  std::to_string(st.db.rows.size()) + "\n";
+                    if (!err.empty()) st.loadLog += "[!] " + err;
+                    st.loadProgress = 0.75f;
+                    loadStep = 2;
+                } else if (loadStep == 2) {
+                    LoadGraph("data/graph.txt", st.graph);
+                    st.loadLog += "[OK] Граф связей: " +
+                                  std::to_string(st.graph.edges.size()) + " рёбер\n";
+                    st.loadProgress = 1.0f;
+                    st.loadLog += "Готово.\n";
+                    loadStep = 3;
+                } else if (loadStep == 3 && elapsed > 0.9f) {
+                    st.screen = Screen::Main;
+                    st.status = "Загружено записей: " +
+                                std::to_string(st.db.rows.size());
+                }
+            }
+        }
+
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        if (st.screen == Screen::Loading) DrawLoadingScreen(st);
+        else                             DrawMainScreen(st);
+
+        ImGui::Render();
+        int w, h;
+        glfwGetFramebufferSize(win, &w, &h);
+        glViewport(0, 0, w, h);
+        glClearColor(0.08f, 0.09f, 0.11f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(win);
+    }
+
+    ImNodes::DestroyContext();
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    glfwDestroyWindow(win);
+    glfwTerminate();
+    return 0;
 }

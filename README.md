@@ -1,72 +1,82 @@
-# SearchHelper 3.1.2
+# SearchHelper
 
-**SearchHelper** is a Windows desktop application for searching through local CSV databases and exploring relationships between matching data.
+OSINT-инструмент под Windows: локальный поиск по CSV + вызов внешних утилит
+(Sherlock, Holehe, Maigret) в одном тёмном интерфейсе.
 
-It provides a dark user interface with table and graph views, making it easier to inspect search results and discover connections.
+## Возможности
 
-## Features
+- Экран загрузки с прогресс-баром и логом.
+- Автосоздание папок `data/` и `modules/` при первом запуске.
+- Поиск по CSV из `data/` (регистронезависимый, по подстроке).
+- Таблица результатов + панель деталей записи.
+- **Конвертация даты рождения в возраст**, если в CSV есть колонка
+  `age` / `birth` / `birthdate` / `dob` / `др` / `дата рождения`.
+  Поддерживаются форматы: `YYYY-MM-DD`, `DD.MM.YYYY`, `DD/MM/YYYY`,
+  `DD-MM-YYYY`, `YYYYMMDD`.
+- **Подсветка всех совпадений** в записи: если подстрока нашлась в двух и
+  более колонках — они подсвечиваются жёлтым, а в деталях выводится блок
+  «Совпадения (N)».
+- Граф связей (ImNodes):
+  - автосвязи по совпадению `email` / `phone` / `тел` / `ник`;
+  - ручное создание связей (кнопка «Добавить связь» → клик по двум узлам);
+  - удаление связи (ПКМ по ребру);
+  - сохранение/загрузка в `data/graph.txt`.
+- OSINT-вкладка:
+  - таблица модулей со статусом «установлен / нет»;
+  - установка в локальную папку `modules/` через
+    `pip install --target=modules <pkg>` (системный Python не трогается);
+  - запуск Sherlock / Holehe / Maigret с живым логом.
 
-- **Local CSV Search** — search through CSV files stored on your computer.
-- **Table View** — view matching records in a structured table.
-- **Relationship Graph** — explore connections between matching data.
-- **Graph Screenshot** — capture the relationship graph and copy the image directly to the Windows clipboard.
-- **Automatic Data Folder** — the application automatically creates a `data` folder on first launch if it does not exist.
-- **Record Details** — select a result to inspect its matching fields.
+## Требования
 
-## Screenshots
+- Windows 10/11
+- MSVC (Visual Studio C++ build tools)
+- CMake ≥ 3.16
+- Python 3.9+ в `PATH` — только для установки OSINT-модулей
+- Интернет — для FetchContent при первой сборке и для `pip install`
 
-_Add application screenshots here._
+## Сборка
 
-## Requirements
-
-- Windows 10 or Windows 11
-- Microsoft Visual C++ (MSVC)
-- CMake
-- Visual Studio C++ build tools
-
-## Build from Source
-
-Open **x64 Native Tools Command Prompt for Visual Studio** and run:
-
+Открыть «x64 Native Tools Command Prompt for VS» в папке проекта:
 ```bat
 cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
-The compiled application will be placed in the build output directory.
+Готовый SearchHelper.exe — в build\Release\.
 
-## Usage
+---
 
-1. Launch SearchHelper.
-2. Place your CSV database files inside the `data` folder next to the application executable.
-3. Enter your search query.
-4. Click **Find**.
-5. Switch between Table View and Relationship Graph to explore the results.
-6. Use the camera button to copy a screenshot of the graph to the clipboard.
+## Использование
 
-## Project Structure
+-   Запустить SearchHelper.exe.
+-   Положить CSV-файлы (первая строка — заголовки) в data/.
+-    Вкладка Таблица — ввести запрос, нажать «Найти».
+-   Вкладка Граф связей — изучить/дополнить связи.
+-   Вкладка OSINT:
+      -   установить нужные модули (кнопка «Установить»);
+      -   ввести username/email и нажать «Запустить <инструмент>»;
+      -   смотреть живой лог внизу вкладки.
 
+Структура проекта
 ```text
+
 SearchHelper/
-├── data/
+├── CMakeLists.txt
+├── README.md
 ├── src/
 │   └── main.cpp
-├── CMakeLists.txt
-└── README.md
+├── data/              (создаётся автоматически)
+│   ├── *.csv
+│   └── graph.txt
+└── modules/           (создаётся автоматически)
+    └── ...
 ```
 
-The `data` folder is created automatically if it is missing.
+---
 
-## Version
+Ограничения
 
-**Current version:** 3.1.2
-
-### What's New in 3.1.2
-
-- Added automatic creation of the `data` directory.
-- Added graph screenshot capture.
-- Added copying graph screenshots directly to the Windows clipboard.
-
-## License
-
-No license has been specified yet.
+   - Полностью автоматическая установка модулей невозможна без Python в PATH.
+   - Первый запуск Sherlock/Maigret медленный — качают базу сайтов.
+   - Антивирус может реагировать на CreateProcessA + cmd.exe /c (ложное).
